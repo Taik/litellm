@@ -766,6 +766,13 @@ def completion(
         k: v for k, v in kwargs.items() if k not in default_params
     }  # model-specific params - pass them straight to the model/provider
 
+    # Allow for env overrides of api_base / api_key / headers
+    api_base = get_secret("LITELLM_OVERRIDE_API_BASE") or api_base
+    api_key = get_secret("LITELLM_OVERRIDE_API_KEY") or api_key
+    headers_override = get_secret("LITELLM_OVERRIDE_HEADERS")
+    if headers_override:
+        headers = json.loads(headers_override)
+
     try:
         if base_url is not None:
             api_base = base_url
