@@ -1,39 +1,25 @@
 # What is this?
 ## Handler file for calling claude-3 on vertex ai
-import copy
 import json
-import os
 import time
 import types
 import uuid
-from enum import Enum
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 import httpx  # type: ignore
-import requests  # type: ignore
 
 import litellm
 from litellm.litellm_core_utils.core_helpers import map_finish_reason
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.types.llms.anthropic import (
     AnthropicMessagesTool,
     AnthropicMessagesToolChoice,
 )
-from litellm.types.llms.openai import (
-    ChatCompletionToolParam,
-    ChatCompletionToolParamFunctionChunk,
-)
-from litellm.types.utils import ResponseFormatChunk
 from litellm.utils import CustomStreamWrapper, ModelResponse, Usage
 
 from .prompt_templates.factory import (
-    construct_tool_use_system_prompt,
     contains_tag,
-    custom_prompt,
     extract_between_tags,
     parse_xml_params,
-    prompt_factory,
-    response_schema_prompt,
 )
 
 
@@ -158,7 +144,7 @@ class VertexAIAnthropicConfig:
                 When using tools in this way: - https://docs.anthropic.com/en/docs/build-with-claude/tool-use#json-mode
                 - You usually want to provide a single tool
                 - You should set tool_choice (see Forcing tool use) to instruct the model to explicitly use that tool
-                - Remember that the model will pass the input to the tool, so the name of the tool and description should be from the model’s perspective.
+                - Remember that the model will pass the input to the tool, so the name of the tool and description should be from the model's perspective.
                 """
                 _tool_choice = None
                 _tool_choice = {"name": "json_tool_call", "type": "tool"}
@@ -236,12 +222,52 @@ def get_vertex_client(
 
 
 def create_vertex_anthropic_url(
-    vertex_location: str, vertex_project: str, model: str, stream: bool
+    api_base: str = None,
+    vertex_location: str = None,
+    vertex_project: str = None,
+    model: str = None,
+    stream: bool = False,
 ) -> str:
-    if stream is True:
-        return f"https://{vertex_location}-aiplatform.googleapis.com/v1/projects/{vertex_project}/locations/{vertex_location}/publishers/anthropic/models/{model}:streamRawPredict"
+    if not api_base:
+        api_base = f"https://{vertex_location}-aiplatform.googleapis.com/v1/projects/{vertex_project}/locations/{vertex_location}/publishers/anthropic/models/{model}"
+
+    if api_base.endswith("rawPredict"):
+        # api_base already has the right endpoint, do not append additional actions to it
+        return api_base
+
+    if stream:
+        api_base = f"{api_base}:streamRawPredict"
     else:
-        return f"https://{vertex_location}-aiplatform.googleapis.com/v1/projects/{vertex_project}/locations/{vertex_location}/publishers/anthropic/models/{model}:rawPredict"
+        api_base = f"{api_base}:rawPredict"
+
+    return api_base
+
+
+def get_vertex_ai_credentials(
+    model: str,
+    stream: bool,
+    vertex_project: Optional[str],
+    vertex_location: Optional[str],
+    vertex_credentials: Optional[str],
+) -> Tuple[str, str, str]:
+    from litellm.llms.vertex_httpx import VertexLLM
+
+    vertex_httpx_logic = VertexLLM()
+    access_token, project_id = vertex_httpx_logic._ensure_access_token(
+        credentials=vertex_credentials, project_id=vertex_project
+    )
+
+    vertex_location = vertex_location or "us-central1"
+    vertex_project = vertex_project or project_id
+
+    api_base = create_vertex_anthropic_url(
+        vertex_location=vertex_location,
+        vertex_project=vertex_project,
+        model=model,
+        stream=stream,
+    )
+
+    return api_base, access_token, vertex_project
 
 
 def completion(
@@ -268,28 +294,19 @@ def completion(
         from anthropic import AnthropicVertex
 
         from litellm.llms.anthropic import AnthropicChatCompletion
-        from litellm.llms.vertex_httpx import VertexLLM
-    except:
+    except ImportError:
         raise VertexAIError(
             status_code=400,
             message="""vertexai import failed please run `pip install -U google-cloud-aiplatform "anthropic[vertex]"`""",
         )
 
-    if not (
-        hasattr(vertexai, "preview") or hasattr(vertexai.preview, "language_models")
-    ):
+    if not (hasattr(vertexai, "preview") or hasattr(vertexai.preview, "language_models")):
         raise VertexAIError(
             status_code=400,
             message="""Upgrade vertex ai. Run `pip install "google-cloud-aiplatform>=1.38"`""",
         )
+
     try:
-
-        vertex_httpx_logic = VertexLLM()
-
-        access_token, project_id = vertex_httpx_logic._ensure_access_token(
-            credentials=vertex_credentials, project_id=vertex_project
-        )
-
         anthropic_chat_completions = AnthropicChatCompletion()
 
         ## Load Config
@@ -301,23 +318,27 @@ def completion(
         ## CONSTRUCT API BASE
         stream = optional_params.get("stream", False)
 
-        api_base = create_vertex_anthropic_url(
-            vertex_location=vertex_location or "us-central1",
-            vertex_project=vertex_project or project_id,
-            model=model,
-            stream=stream,
-        )
+        api_base_override = litellm_params.get("api_base", None)
+        api_key_override = litellm_params.get("api_key", None)
 
-        if headers is not None:
-            vertex_headers = headers
+        if api_base_override and api_key_override:
+            api_base = create_vertex_anthropic_url(api_base=api_base_override, stream=stream)
+            access_token = api_key_override
         else:
-            vertex_headers = {}
+            ## Get Vertex AI credentials
+            api_base, access_token, vertex_project = get_vertex_ai_credentials(
+                model,
+                stream,
+                vertex_project,
+                vertex_location or "us-central1",
+                vertex_credentials,
+            )
 
-        vertex_headers.update({"Authorization": "Bearer {}".format(access_token)})
+        ## Prepare headers
+        vertex_headers = headers or {}
+        vertex_headers.update({"Authorization": f"Bearer {access_token}"})
 
-        optional_params.update(
-            {"anthropic_version": "vertex-2023-10-16", "is_vertex_request": True}
-        )
+        optional_params.update({"anthropic_version": "vertex-2023-10-16", "is_vertex_request": True})
 
         return anthropic_chat_completions.completion(
             model=model,
